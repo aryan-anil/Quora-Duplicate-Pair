@@ -47,7 +47,14 @@ def run_inference(question1: str, question2: str, model_path: str,
     config = AutoConfig.from_pretrained(model_name)
     num_labels = 2
     model = DuplicateClassifier(model_name, num_labels).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    checkpoint = torch.load(model_path, map_location=device)
+    # Checkpoints saved during training contain a dict with metadata;
+    # checkpoints saved with just model.state_dict() are loaded directly.
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    else:
+        state_dict = checkpoint
+    model.load_state_dict(state_dict)
     model.eval()
 
     # ── Tokenize the question pair ────────────────────────────────────────
@@ -101,7 +108,7 @@ def main():
     # ── Variables ─────────────────────────────────────────────────────────
     question1 = "What is a cat?"
     question2 = "What is a dog?"
-    model_path = r"C:\Users\Aryan\Documents\DuplicateQuestions\approach1_transformer\outputs\best_model_fold0.pt"
+    model_path = r"C:\Users\Aryan\Documents\DuplicateQuestions\approach1_transformer\outputs\model_fold0_epoch3.pt"
 
     result = run_inference(question1, question2, model_path,
                            model_name=args.model_name,
