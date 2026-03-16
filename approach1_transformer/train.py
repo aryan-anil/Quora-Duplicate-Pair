@@ -5,6 +5,7 @@ Usage:
     python -m approach1_transformer.train
     python -m approach1_transformer.train --dry-run          # quick sanity check
     python -m approach1_transformer.train --model bert-base-uncased
+    python -m approach1_transformer.train --model-path outputs/best_model_fold0.pt # resume training
 """
 import argparse
 import json
@@ -17,6 +18,7 @@ from transformers import AutoModel, AutoTokenizer, get_cosine_schedule_with_warm
 import numpy as np
 import pandas as pd
 import torch
+from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 from sklearn.metrics import accuracy_score, f1_score, log_loss
 from torch.cuda.amp import GradScaler, autocast
@@ -134,6 +136,21 @@ def train_one_fold(cfg: TrainConfig, train_df: pd.DataFrame,
     ]
     optimizer = torch.optim.AdamW(params, lr=cfg.learning_rate)
 
+    # ── load checkpoint ───────────────────────────────────────────────────
+    start_epoch = 1
+    best_metric = -1.0
+    if getattr(cfg, 'model_path', None) is not None:
+        if os.path.isfile(cfg.model_path):
+            log.info(f"  Loading checkpoint from {cfg.model_path}...")
+            checkpoint = torch.load(cfg.model_path, map_location=device)
+            model.load_state_dict(checkpoint["model_state_dict"])
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            start_epoch = checkpoint.get("epoch", 0) + 1
+            best_metric = checkpoint.get("best_metric", -1.0)
+            log.info(f"  Resumed from epoch {start_epoch - 1}")
+        else:
+            log.warning(f"  Checkpoint {cfg.model_path} not found! Starting from scratch.")
+
     total_steps = len(train_loader) * cfg.epochs
     warmup_steps = int(total_steps * cfg.warmup_ratio)
     scheduler = get_cosine_schedule_with_warmup(
@@ -142,12 +159,17 @@ def train_one_fold(cfg: TrainConfig, train_df: pd.DataFrame,
     )
     scaler = GradScaler(enabled=cfg.fp16 and device.type == "cuda")
 
+    # ── tensorboard ───────────────────────────────────────────────────────
+    tb_dir = os.path.join(cfg.output_dir, f"runs/fold_{fold_idx}")
+    os.makedirs(tb_dir, exist_ok=True)
+    tb_writer = SummaryWriter(log_dir=tb_dir)
+
     # ── training ──────────────────────────────────────────────────────────
-    best_metric = -1.0
     patience_counter = 0
     history = []
+    global_step = (start_epoch - 1) * len(train_loader)
 
-    for epoch in range(1, cfg.epochs + 1):
+    for epoch in range(start_epoch, cfg.epochs + 1):
         model.train()
         running_loss = 0.0
         t_start = time.time()
@@ -155,6 +177,7 @@ def train_one_fold(cfg: TrainConfig, train_df: pd.DataFrame,
         pbar = tqdm(enumerate(train_loader, 1), total=len(train_loader),
                     desc=f"  Epoch {epoch}/{cfg.epochs}")
         for step, batch in pbar:
+            global_step += 1
             batch = {k: v.to(device) for k, v in batch.items()}
 
             with autocast(enabled=cfg.fp16 and device.type == "cuda"):
@@ -178,12 +201,23 @@ def train_one_fold(cfg: TrainConfig, train_df: pd.DataFrame,
             running_loss += loss.item()
             avg_loss = running_loss / step
             pbar.set_postfix({"loss": f"{avg_loss:.4f}", "lr": f"{scheduler.get_last_lr()[0]:.2e}"})
+            
+            # Log step training loss
+            tb_writer.add_scalar("Loss/train_step", loss.item(), global_step)
 
         # ── validation ────────────────────────────────────────────────────
         metrics = evaluate(model, val_loader, device)
         elapsed = time.time() - t_start
+        train_loss_epoch = running_loss / len(train_loader)
+
+        # Log epoch metrics to TensorBoard (Loss and F1)
+        tb_writer.add_scalar("Loss/train_epoch", train_loss_epoch, epoch)
+        tb_writer.add_scalar("Loss/val_epoch", metrics["loss"], epoch)
+        tb_writer.add_scalar("Metrics/val_f1", metrics["f1"], epoch)
+
         log.info(
             f"[Fold {fold_idx}] Epoch {epoch}/{cfg.epochs}  "
+            f"train_loss={train_loss_epoch:.4f}  "
             f"val_loss={metrics['loss']:.4f}  "
             f"acc={metrics['accuracy']:.4f}  "
             f"f1={metrics['f1']:.4f}  "
@@ -191,25 +225,41 @@ def train_one_fold(cfg: TrainConfig, train_df: pd.DataFrame,
             f"({elapsed:.0f}s)"
         )
         metrics["epoch"] = epoch
-        metrics["train_loss"] = running_loss / len(train_loader)
+        metrics["train_loss"] = train_loss_epoch
         history.append(metrics)
 
-        # ── early stopping & checkpointing ────────────────────────────────
+        # ── save checkpoint (every epoch) ─────────────────────────────────
+        os.makedirs(cfg.output_dir, exist_ok=True)
+        save_dict = {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "best_metric": best_metric
+        }
+        
+        epoch_ckpt = os.path.join(cfg.output_dir, f"model_fold{fold_idx}_epoch{epoch}.pt")
+        torch.save(save_dict, epoch_ckpt)
+        log.info(f"  ✓ Saved epoch {epoch} checkpoint → {epoch_ckpt}")
+
+        # ── early stopping & best checkpointing ───────────────────────────
         current = metrics[cfg.metric_for_best]
         if current > best_metric:
             best_metric = current
             patience_counter = 0
-            ckpt = os.path.join(cfg.output_dir,
-                                f"best_model_fold{fold_idx}.pt")
-            torch.save(model.state_dict(), ckpt)
-            log.info(f"  ✓ Saved best model ({cfg.metric_for_best}="
-                     f"{best_metric:.4f}) → {ckpt}")
+            
+            # Update best_metric in dict and save best model
+            save_dict["best_metric"] = best_metric
+            best_ckpt = os.path.join(cfg.output_dir, f"best_model_fold{fold_idx}.pt")
+            torch.save(save_dict, best_ckpt)
+            log.info(f"  ★ New best model ({cfg.metric_for_best}="
+                     f"{best_metric:.4f}) → {best_ckpt}")
         else:
             patience_counter += 1
             if patience_counter >= cfg.patience:
                 log.info(f"  Early stopping at epoch {epoch}")
                 break
-
+                
+    tb_writer.close()
     return {"best_metric": best_metric, "history": history}
 
 
@@ -221,6 +271,8 @@ def main():
         description="Fine-tune a transformer on Quora duplicate questions.")
     parser.add_argument("--model", type=str, default=None,
                         help="Override model name, e.g. bert-base-uncased")
+    parser.add_argument("--model-path", type=str, default=None,
+                        help="Path to a checkpoint (.pt) to resume training")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
@@ -233,6 +285,11 @@ def main():
     cfg = TrainConfig()
     if args.model:
         cfg.model_name = args.model
+    if args.model_path:
+        cfg.model_path = args.model_path
+    else:
+        cfg.model_path = None
+        
     if args.epochs:
         cfg.epochs = args.epochs
     if args.lr:
@@ -275,6 +332,7 @@ def main():
             all_results.append(result)
 
     # ── save summary ──────────────────────────────────────────────────────
+    os.makedirs(cfg.output_dir, exist_ok=True)
     summary_path = os.path.join(cfg.output_dir, "train_summary.json")
     with open(summary_path, "w") as f:
         json.dump(all_results, f, indent=2, default=str)

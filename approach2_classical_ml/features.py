@@ -10,7 +10,6 @@ Feature groups:
 """
 import hashlib
 import logging
-import os
 import re
 import string
 from collections import defaultdict
